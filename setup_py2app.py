@@ -60,12 +60,18 @@ OPTIONS = {
         "pyperclip",
     ],
     "frameworks": [],
-    "iconfile": None,
+    "iconfile": "Speako.icns",
 }
 
 setup(
     app=APP,
     name="Speako",
+    data_files=[
+        ("", [
+            "menubar_iconTemplate.png",
+            "menubar_iconTemplate@2x.png",
+        ]),
+    ],
     options={"py2app": OPTIONS},
     setup_requires=["py2app"],
 )

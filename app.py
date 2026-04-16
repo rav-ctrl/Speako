@@ -16,6 +16,7 @@ First-launch flow:
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -95,20 +96,53 @@ def ensure_models() -> None:
 # Synth worker
 # ---------------------------------------------------------------------------
 
+_SENTENCE_RE = re.compile(r'(?<=[.!?;])\s+|\n+')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentence-sized chunks for streaming synthesis."""
+    parts = _SENTENCE_RE.split(text)
+    chunks: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # If a chunk is very long (no punctuation), split at commas.
+        if len(p) > 400:
+            sub = [s.strip() for s in p.split(",") if s.strip()]
+            chunks.extend(sub)
+        else:
+            chunks.append(p)
+    return chunks or [text.strip()]
+
+
+# Sentinel pushed into the audio queue to signal end-of-text.
+_END = object()
+
+
 class Synth:
     def __init__(self) -> None:
-        # Import lazily — kokoro_onnx loads onnxruntime which is heavy.
+        import traceback as _tb
+        self._tb = _tb
         from kokoro_onnx import Kokoro
         log("Loading Kokoro model")
         self.kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH))
-        self.q: "queue.Queue[str | None]" = queue.Queue()
+
+        # Incoming text requests (full clipboard payloads).
+        self.text_q: "queue.Queue[str | None]" = queue.Queue()
+        # Pre-synthesized audio chunks ready for playback (producer→consumer).
+        self.audio_q: "queue.Queue[tuple[np.ndarray, int] | object]" = queue.Queue(maxsize=2)
+
         self.lock = threading.Lock()
         self.last_text: str | None = None
         self.voice = "af_sarah"
         self.speed = 1.0
         self.playing = False
+        self._stop_flag = threading.Event()
+
         self._load_state()
-        threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._synth_producer, daemon=True).start()
+        threading.Thread(target=self._play_consumer, daemon=True).start()
         log(f"Synth ready (voice={self.voice} speed={self.speed})")
 
     def _load_state(self) -> None:
@@ -132,35 +166,62 @@ class Synth:
         except Exception as e:
             log(f"state save: {e!r}")
 
-    def _worker(self) -> None:
-        import traceback
+    def _synth_producer(self) -> None:
+        """Pull full text from text_q, split into sentences, synthesize each
+        one, and push (samples, sr) onto audio_q for the consumer."""
         while True:
-            text = self.q.get()
+            text = self.text_q.get()
             if text is None:
                 continue
+            self._stop_flag.clear()
             with self.lock:
                 voice, speed = self.voice, self.speed
-            log(f"worker: synthesizing {len(text)} chars voice={voice} speed={speed}")
-            try:
-                samples, sr = self.kokoro.create(
-                    text, voice=voice, speed=speed, lang=LANG
-                )
-                samples = np.asarray(samples, dtype=np.float32)
-                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-                log(f"worker: synth ok samples={samples.shape} sr={sr} peak={peak:.3f}")
+            chunks = _split_sentences(text)
+            log(f"producer: {len(text)} chars → {len(chunks)} chunks")
+            for i, chunk in enumerate(chunks):
+                if self._stop_flag.is_set():
+                    log("producer: stop flag, aborting")
+                    break
+                log(f"producer: synth chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
                 try:
-                    dev = sd.query_devices(kind="output")
-                    log(f"worker: output device={dev.get('name')!r} default_sr={dev.get('default_samplerate')}")
-                except Exception as de:
-                    log(f"worker: query_devices failed: {de!r}")
+                    samples, sr = self.kokoro.create(
+                        chunk, voice=voice, speed=speed, lang=LANG
+                    )
+                    samples = np.asarray(samples, dtype=np.float32)
+                    log(f"producer: chunk {i+1} ok samples={samples.shape} sr={sr}")
+                except Exception as e:
+                    log(f"producer: synth error chunk {i+1}: {e!r}\n{self._tb.format_exc()}")
+                    continue
+                # Blocking put — if audio_q is full (size 2), we wait here
+                # until the consumer finishes playing the current chunk.
+                # Check stop flag while waiting.
+                while not self._stop_flag.is_set():
+                    try:
+                        self.audio_q.put((samples, sr), timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+            # Signal end-of-text so consumer knows to go idle.
+            if not self._stop_flag.is_set():
+                self.audio_q.put(_END)
+
+    def _play_consumer(self) -> None:
+        """Pull pre-synthesized (samples, sr) from audio_q and play them
+        back-to-back for gapless streaming."""
+        while True:
+            item = self.audio_q.get()
+            if item is _END or item is None:
+                self.playing = False
+                continue
+            samples, sr = item
+            try:
                 self.playing = True
                 sd.play(samples, sr)
                 sd.wait()
-                log("worker: playback done")
             except Exception as e:
-                log(f"synth error: {e!r}\n{traceback.format_exc()}")
-            finally:
-                self.playing = False
+                log(f"consumer: play error: {e!r}")
+            # Don't set self.playing = False here — next chunk may be ready
+            # immediately. We set it False on _END or stop().
 
     def say(self, text: str) -> str:
         text = (text or "").strip()
@@ -170,19 +231,30 @@ class Synth:
             if text == self.last_text:
                 return "duplicate"
             self.last_text = text
-        self.q.put(text)
+        self.text_q.put(text)
         return "queued"
 
     def stop(self) -> None:
+        # 1. Signal producer to abort current synthesis.
+        self._stop_flag.set()
+        # 2. Drain text queue (pending full-text requests).
         try:
             while True:
-                self.q.get_nowait()
+                self.text_q.get_nowait()
         except queue.Empty:
             pass
+        # 3. Drain audio queue (pre-synthesized chunks waiting to play).
+        try:
+            while True:
+                self.audio_q.get_nowait()
+        except queue.Empty:
+            pass
+        # 4. Stop current playback.
         try:
             sd.stop()
         except Exception as e:
             log(f"sd.stop: {e!r}")
+        self.playing = False
         with self.lock:
             self.last_text = None
 
@@ -220,7 +292,21 @@ def grab_selection() -> str:
 
 class TTSApp(rumps.App):
     def __init__(self, synth: Synth) -> None:
-        super().__init__("🔊", quit_button=None)
+        # Resolve menu bar icon relative to the app bundle or script location.
+        icon_path = None
+        for base in [
+            Path(sys.executable).resolve().parent.parent / "Resources",  # py2app bundle
+            Path(__file__).resolve().parent,                              # dev/script mode
+        ]:
+            candidate = base / "menubar_iconTemplate.png"
+            if candidate.exists():
+                icon_path = str(candidate)
+                break
+        super().__init__("Speako", icon=icon_path, template=True, quit_button=None)
+        if icon_path:
+            log(f"Menu bar icon: {icon_path}")
+        else:
+            log("Menu bar icon not found, using text fallback")
         self.synth = synth
 
         self.speak_item = rumps.MenuItem("Speak selection", callback=self.on_speak)
@@ -303,7 +389,8 @@ class TTSApp(rumps.App):
         self.status_item.title = (
             f"Status: {state} · {self.synth.voice} · {self.synth.speed:g}×"
         )
-        self.title = "🔊" if self.synth.playing else "🔉"
+        # Don't overwrite the icon with emoji — just keep the template icon.
+        # Status is visible in the menu's status line.
 
 
 # ---------------------------------------------------------------------------
