@@ -87,6 +87,92 @@ def ensure_models() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Text cleanup — strip markdown so we don't speak "asterisk asterisk bold"
+# ---------------------------------------------------------------------------
+
+# Order matters: fenced/inline code blocks are processed first (before their
+# contents get touched by other rules), then structural markers, then inline
+# emphasis, and finally stray symbols.
+
+_RE_FENCED_CODE = re.compile(r"```[\w+-]*\n?(.*?)```", re.DOTALL)
+_RE_INLINE_CODE = re.compile(r"`([^`]+)`")
+_RE_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_RE_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_RE_REF_LINK = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")
+_RE_AUTOLINK = re.compile(r"<(https?://[^>]+)>")
+_RE_HTML_TAG = re.compile(r"<[^>]+>")
+_RE_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
+_RE_BLOCKQUOTE = re.compile(r"^\s{0,3}>\s?", re.MULTILINE)
+_RE_HR = re.compile(r"^\s{0,3}([-*_])\s*\1\s*\1[\s\1]*$", re.MULTILINE)
+_RE_LIST_BULLET = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
+_RE_LIST_NUM = re.compile(r"^\s*\d+[.)]\s+", re.MULTILINE)
+_RE_BOLD_ITALIC = re.compile(r"(\*\*\*|___)(.+?)\1", re.DOTALL)
+_RE_BOLD = re.compile(r"(\*\*|__)(.+?)\1", re.DOTALL)
+_RE_ITALIC = re.compile(r"(?<![A-Za-z0-9])([*_])(?!\s)(.+?)(?<!\s)\1(?![A-Za-z0-9])", re.DOTALL)
+_RE_STRIKE = re.compile(r"~~(.+?)~~", re.DOTALL)
+_RE_TABLE_PIPE = re.compile(r"^\s*\|?(.+?)\|?\s*$", re.MULTILINE)
+_RE_TABLE_SEP = re.compile(r"^\s*\|?[\s\-:|]+\|[\s\-:|]+\s*$", re.MULTILINE)
+_RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
+_RE_MULTI_SPACE = re.compile(r"[ \t]{2,}")
+
+
+def strip_markdown(text: str) -> str:
+    """Remove markdown formatting so TTS doesn't read symbols aloud.
+
+    Handles: headings, bold/italic, inline + fenced code, links (keeps link
+    text), images (keeps alt), lists, blockquotes, strikethrough, horizontal
+    rules, HTML tags, pipe tables, and stray emphasis markers.
+    """
+    if not text:
+        return ""
+
+    # 1. Code: keep contents, drop backticks. Fenced first so its inner
+    #    content isn't touched by other rules.
+    text = _RE_FENCED_CODE.sub(lambda m: m.group(1), text)
+    text = _RE_INLINE_CODE.sub(lambda m: m.group(1), text)
+
+    # 2. Links and images: keep the readable label, drop the URL.
+    text = _RE_IMAGE.sub(lambda m: m.group(1), text)
+    text = _RE_LINK.sub(lambda m: m.group(1), text)
+    text = _RE_REF_LINK.sub(lambda m: m.group(1), text)
+    text = _RE_AUTOLINK.sub("", text)   # bare URLs — drop entirely
+
+    # 3. HTML tags (e.g. <br>, <sup>).
+    text = _RE_HTML_TAG.sub("", text)
+
+    # 4. Block-level markers. Order: HR before list bullets, table sep before
+    #    table pipes.
+    text = _RE_HR.sub("", text)
+    text = _RE_HEADING.sub("", text)
+    text = _RE_BLOCKQUOTE.sub("", text)
+    text = _RE_LIST_BULLET.sub("", text)
+    text = _RE_LIST_NUM.sub("", text)
+
+    # 5. Tables: drop separator rows, replace pipes in data rows with commas
+    #    so row cells read as a list.
+    text = _RE_TABLE_SEP.sub("", text)
+    text = re.sub(r"^\s*\|\s*(.+?)\s*\|\s*$",
+                  lambda m: m.group(1).replace("|", ", "),
+                  text, flags=re.MULTILINE)
+
+    # 6. Inline emphasis. Bold-italic first (longest marker), then bold,
+    #    then italic.
+    text = _RE_BOLD_ITALIC.sub(lambda m: m.group(2), text)
+    text = _RE_BOLD.sub(lambda m: m.group(2), text)
+    text = _RE_ITALIC.sub(lambda m: m.group(2), text)
+    text = _RE_STRIKE.sub(lambda m: m.group(1), text)
+
+    # 7. Stray emphasis characters left behind (e.g. unmatched * or _).
+    text = re.sub(r"[*_`~]+", "", text)
+
+    # 8. Whitespace cleanup.
+    text = _RE_MULTI_NEWLINE.sub("\n\n", text)
+    text = _RE_MULTI_SPACE.sub(" ", text)
+
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # Synth worker
 # ---------------------------------------------------------------------------
 
@@ -218,14 +304,21 @@ class Synth:
             # immediately. We set it False on _END or stop().
 
     def say(self, text: str) -> str:
-        text = (text or "").strip()
-        if not text:
+        raw = (text or "").strip()
+        if not raw:
             return "empty"
+        cleaned = strip_markdown(raw)
+        if not cleaned:
+            return "empty"
+        if cleaned != raw:
+            log(f"say: stripped markdown {len(raw)} → {len(cleaned)} chars")
         with self.lock:
-            if text == self.last_text:
+            # Deduplicate on the cleaned payload so re-copying the same
+            # formatted text doesn't re-trigger playback.
+            if cleaned == self.last_text:
                 return "duplicate"
-            self.last_text = text
-        self.text_q.put(text)
+            self.last_text = cleaned
+        self.text_q.put(cleaned)
         return "queued"
 
     def stop(self) -> None:
