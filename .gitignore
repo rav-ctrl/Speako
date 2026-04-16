@@ -1,6 +1,21 @@
+# Build artifacts
 .buildenv/
 build/
 dist/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

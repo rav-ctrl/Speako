@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""Speako — standalone macOS menu bar app.
+"""Speako — macOS menu bar TTS app powered by Kokoro ONNX.
 
-Combines menu bar UI, global hotkey (Ctrl+Alt+Cmd+\), and Kokoro TTS synthesis
-into a single process. Designed to be bundled with py2app.
+Copy any text, press the hotkey (⌃⌥⌘\\), and hear it spoken aloud.
+Uses sentence-level chunked synthesis for instant playback regardless
+of text length.
 
-First-launch flow:
-    1. Ensure model files in ~/Library/Application Support/Speako/;
-       download if missing.
-    2. Start rumps menu bar + pynput hotkey listener + synth worker thread.
-    3. On hotkey or menu "Speak selection":
-         - simulate Cmd+C
-         - read clipboard
-         - queue for synthesis
+Bundled as a standalone .app via py2app. See scripts/build_dmg.sh.
 """
 
 import os
@@ -296,7 +290,7 @@ class TTSApp(rumps.App):
         icon_path = None
         for base in [
             Path(sys.executable).resolve().parent.parent / "Resources",  # py2app bundle
-            Path(__file__).resolve().parent,                              # dev/script mode
+            Path(__file__).resolve().parent.parent / "assets",            # dev/script mode
         ]:
             candidate = base / "menubar_iconTemplate.png"
             if candidate.exists():
