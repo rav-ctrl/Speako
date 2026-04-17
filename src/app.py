@@ -293,6 +293,12 @@ class Synth:
             if item is _END or item is None:
                 self.playing = False
                 continue
+            # If stop was triggered, discard any chunks that slipped into the
+            # queue (race: draining audio_q in stop() can free a slot, which
+            # unblocks the producer's put and lets one more chunk through).
+            if self._stop_flag.is_set():
+                self.playing = False
+                continue
             samples, sr = item
             try:
                 self.playing = True
@@ -300,8 +306,10 @@ class Synth:
                 sd.wait()
             except Exception as e:
                 log(f"consumer: play error: {e!r}")
-            # Don't set self.playing = False here — next chunk may be ready
-            # immediately. We set it False on _END or stop().
+            # After playback, re-check the stop flag so we don't blast into
+            # the next queued chunk if Stop was hit mid-playback.
+            if self._stop_flag.is_set():
+                self.playing = False
 
     def say(self, text: str) -> str:
         raw = (text or "").strip()
