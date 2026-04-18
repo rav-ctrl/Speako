@@ -114,15 +114,30 @@ def _num_to_words(num_str: str) -> str:
         return num_str
 
 
-def _speak_currency(amount_str: str, symbol: str) -> str:
-    """Turn '$25,000' / '$25.50' into 'twenty-five thousand dollars' /
-    'twenty-five dollars and fifty cents'."""
+_SUFFIX_MULTIPLIERS = {
+    "k": 1_000,
+    "m": 1_000_000,
+    "b": 1_000_000_000,
+}
+
+
+def _speak_currency(amount_str: str, symbol: str,
+                    suffix: str = "", per_unit: str = "") -> str:
+    """Turn '$25,000' → 'twenty-five thousand dollars', '$25.50' →
+    'twenty-five dollars and fifty cents', '$60K' → 'sixty thousand dollars',
+    '$12/month' → 'twelve dollars per month'."""
     plural, singular, cents_plural, cents_singular = _CURRENCY_NAMES.get(
         symbol, ("", "", "", "")
     )
     cleaned = amount_str.replace(",", "")
     try:
-        if "." in cleaned:
+        if suffix:
+            # K/M/B → convert to an integer magnitude, then speak.
+            multiplier = _SUFFIX_MULTIPLIERS[suffix.lower()]
+            value = int(round(float(cleaned) * multiplier))
+            unit = singular if value == 1 else plural
+            result = f"{num2words(value)} {unit}"
+        elif "." in cleaned:
             whole_str, frac_str = cleaned.split(".", 1)
             whole = int(whole_str) if whole_str else 0
             # Pad/truncate fractional part to 2 digits for currencies.
@@ -130,18 +145,26 @@ def _speak_currency(amount_str: str, symbol: str) -> str:
             whole_words = num2words(whole)
             whole_unit = singular if whole == 1 else plural
             if frac == 0:
-                return f"{whole_words} {whole_unit}"
-            frac_words = num2words(frac)
-            frac_unit = cents_singular if frac == 1 else cents_plural
-            return f"{whole_words} {whole_unit} and {frac_words} {frac_unit}"
-        value = int(cleaned)
-        unit = singular if value == 1 else plural
-        return f"{num2words(value)} {unit}"
+                result = f"{whole_words} {whole_unit}"
+            else:
+                frac_words = num2words(frac)
+                frac_unit = cents_singular if frac == 1 else cents_plural
+                result = f"{whole_words} {whole_unit} and {frac_words} {frac_unit}"
+        else:
+            value = int(cleaned)
+            unit = singular if value == 1 else plural
+            result = f"{num2words(value)} {unit}"
     except (ValueError, OverflowError):
         return amount_str + symbol
+    if per_unit:
+        result = f"{result} per {per_unit}"
+    return result
 
 
-_RE_CURRENCY = re.compile(r"([\$€£¥₹₽])\s*(\d[\d,]*(?:\.\d+)?)")
+# Currency pattern: optional K/M/B suffix, optional "/unit" for rates.
+_RE_CURRENCY = re.compile(
+    r"([\$€£¥₹₽])\s*(\d[\d,]*(?:\.\d+)?)([KMBkmb])?(?:\s*/\s*([A-Za-z]+))?"
+)
 _RE_PERCENT = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*%")
 _RE_COMMA_NUMBER = re.compile(r"\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b")
 
@@ -151,7 +174,12 @@ def normalize_numbers(text: str) -> str:
     words so the TTS reads them naturally. Leaves small plain numbers alone
     (Kokoro handles those fine)."""
     text = _RE_CURRENCY.sub(
-        lambda m: _speak_currency(m.group(2), m.group(1)), text
+        lambda m: _speak_currency(
+            m.group(2), m.group(1),
+            suffix=m.group(3) or "",
+            per_unit=m.group(4) or "",
+        ),
+        text,
     )
     text = _RE_PERCENT.sub(
         lambda m: f"{_num_to_words(m.group(1))} percent", text
