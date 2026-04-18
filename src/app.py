@@ -87,6 +87,82 @@ def ensure_models() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Number / currency normalization — Kokoro reads "$25,000" as
+# "dollar two five zero zero zero" otherwise.
+# ---------------------------------------------------------------------------
+
+from num2words import num2words  # type: ignore
+
+_CURRENCY_NAMES = {
+    "$": ("dollars", "dollar", "cents", "cent"),
+    "€": ("euros", "euro", "cents", "cent"),
+    "£": ("pounds", "pound", "pence", "pence"),
+    "¥": ("yen", "yen", "sen", "sen"),
+    "₹": ("rupees", "rupee", "paise", "paise"),
+    "₽": ("rubles", "ruble", "kopecks", "kopeck"),
+}
+
+
+def _num_to_words(num_str: str) -> str:
+    """Convert a numeric string (possibly with commas/decimal) to words."""
+    cleaned = num_str.replace(",", "")
+    try:
+        if "." in cleaned:
+            return num2words(float(cleaned))
+        return num2words(int(cleaned))
+    except (ValueError, OverflowError):
+        return num_str
+
+
+def _speak_currency(amount_str: str, symbol: str) -> str:
+    """Turn '$25,000' / '$25.50' into 'twenty-five thousand dollars' /
+    'twenty-five dollars and fifty cents'."""
+    plural, singular, cents_plural, cents_singular = _CURRENCY_NAMES.get(
+        symbol, ("", "", "", "")
+    )
+    cleaned = amount_str.replace(",", "")
+    try:
+        if "." in cleaned:
+            whole_str, frac_str = cleaned.split(".", 1)
+            whole = int(whole_str) if whole_str else 0
+            # Pad/truncate fractional part to 2 digits for currencies.
+            frac = int((frac_str + "00")[:2])
+            whole_words = num2words(whole)
+            whole_unit = singular if whole == 1 else plural
+            if frac == 0:
+                return f"{whole_words} {whole_unit}"
+            frac_words = num2words(frac)
+            frac_unit = cents_singular if frac == 1 else cents_plural
+            return f"{whole_words} {whole_unit} and {frac_words} {frac_unit}"
+        value = int(cleaned)
+        unit = singular if value == 1 else plural
+        return f"{num2words(value)} {unit}"
+    except (ValueError, OverflowError):
+        return amount_str + symbol
+
+
+_RE_CURRENCY = re.compile(r"([\$€£¥₹₽])\s*(\d[\d,]*(?:\.\d+)?)")
+_RE_PERCENT = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*%")
+_RE_COMMA_NUMBER = re.compile(r"\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b")
+
+
+def normalize_numbers(text: str) -> str:
+    """Expand currency amounts, percentages, and comma-grouped numbers into
+    words so the TTS reads them naturally. Leaves small plain numbers alone
+    (Kokoro handles those fine)."""
+    text = _RE_CURRENCY.sub(
+        lambda m: _speak_currency(m.group(2), m.group(1)), text
+    )
+    text = _RE_PERCENT.sub(
+        lambda m: f"{_num_to_words(m.group(1))} percent", text
+    )
+    # Any remaining numbers with thousands-commas (not already consumed by
+    # currency rule, e.g. "3,500 people").
+    text = _RE_COMMA_NUMBER.sub(lambda m: _num_to_words(m.group(0)), text)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Text cleanup — strip markdown so we don't speak "asterisk asterisk bold"
 # ---------------------------------------------------------------------------
 
@@ -316,10 +392,11 @@ class Synth:
         if not raw:
             return "empty"
         cleaned = strip_markdown(raw)
+        cleaned = normalize_numbers(cleaned)
         if not cleaned:
             return "empty"
         if cleaned != raw:
-            log(f"say: stripped markdown {len(raw)} → {len(cleaned)} chars")
+            log(f"say: normalized {len(raw)} → {len(cleaned)} chars")
         with self.lock:
             # Deduplicate on the cleaned payload so re-copying the same
             # formatted text doesn't re-trigger playback.

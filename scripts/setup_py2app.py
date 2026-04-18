@@ -47,6 +47,7 @@ OPTIONS = {
         "threading",
         "urllib.request",
         "pyperclip",
+        "num2words",
     ],
     "frameworks": [],
     "iconfile": "assets/Speako.icns",

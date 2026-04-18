@@ -67,7 +67,7 @@ source "${BUILD_VENV}/bin/activate"
 
 echo "==> Installing build dependencies"
 pip install --upgrade pip wheel
-pip install py2app rumps pynput pyperclip sounddevice kokoro-onnx
+pip install py2app rumps pynput pyperclip sounddevice kokoro-onnx num2words
 
 echo "==> Cleaning prior build output"
 rm -rf build "${DIST_DIR}/${APP_NAME}.app" "${DIST_DIR}/${DMG_NAME}" "${STAGING_DIR}"
