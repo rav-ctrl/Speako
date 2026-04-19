@@ -350,6 +350,23 @@ class Synth:
         except Exception as e:
             log(f"state save: {e!r}")
 
+    def _refresh_audio_device(self) -> None:
+        """Re-initialize PortAudio so it picks up the current system default
+        output device. Needed because PortAudio caches the device list at
+        startup and won't notice when the user plugs in AirPods / switches
+        outputs mid-session."""
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            log(f"audio refresh failed: {e!r}")
+            return
+        try:
+            dev = sd.query_devices(kind="output")
+            log(f"audio device (refreshed): {dev.get('name')!r}")
+        except Exception:
+            pass
+
     def _synth_producer(self) -> None:
         """Pull full text from text_q, split into sentences, synthesize each
         one, and push (samples, sr) onto audio_q for the consumer."""
@@ -358,6 +375,9 @@ class Synth:
             if text is None:
                 continue
             self._stop_flag.clear()
+            # Re-query the default audio device before each new speech
+            # request so we follow the user's headphone/speaker switches.
+            self._refresh_audio_device()
             with self.lock:
                 voice, speed = self.voice, self.speed
             chunks = _split_sentences(text)
